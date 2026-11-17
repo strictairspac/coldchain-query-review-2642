@@ -1,1 +1,3 @@
 Schema version 1: SQLAlchemy metadata creates users/samples/batches/evidence/audit. seed_demo initializes the separate invoices fixture table and NOLOGIN query_reader. invoices is the only permitted SQL source. Run `python -m scripts.seed_demo` for repeatable initialization; natural keys preserve user edits.
+
+Schema version 2 (账单更正导入): metadata additionally creates meta/imports/import_items; invoices gains `version`/`voided` and evidence gains `data_version`/`read_invoice_ids` via idempotent ALTER in seed_demo, so existing databases upgrade in place. `meta.data_version` is the source-data generation counter bumped by every applied correction import; evidence validity is computed by comparing it with the imports' affected invoice sets.

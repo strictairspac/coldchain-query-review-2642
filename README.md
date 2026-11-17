@@ -10,15 +10,16 @@
 
 1. 样本库：登记名称、口径说明与原始 SELECT，防止重名；提供温控合格、路线费用、异常温控三个起始样本。
 2. SQL 复核：选择基准，编辑候选，校验后创建独立批次并入 Redis 队列。
-3. 运行历史：跟踪 queued/running/passed/different/failed，失败也保留证据。
-4. 证据详情：真实 EXPLAIN ANALYZE、两侧结果行、SHA-256 摘要、遗漏/新增行和 JSON 下载。
-5. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
+3. 运行历史：跟踪 queued/running/passed/different/failed/stale，失败也保留证据。
+4. 证据详情：真实 EXPLAIN ANALYZE、两侧结果行、SHA-256 摘要、遗漏/新增行和 JSON 下载；源数据更正后受影响证据自动标记失效。
+5. 账单更正：导入含账单号、递增版本、作废标记的 CSV 更正文件；同号仅采用新版本，同版本异内容整批拒绝，作废为终态；每批从校验到生效或拒绝逐行可查。
+6. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
 
 | 角色 | 主要页面 | 权限与典型动作 |
 |---|---|---|
-| admin 管理员 | 全部页面、审计 | 创建样本/批次、查看/导出结果、查看写操作审计 |
-| operator 操作员 | 四个业务页面 | 登记 SQL、提交后台复核、查看/导出结果；不可查看管理员审计 |
-| viewer 观察员 | 四个业务页面 | 只读与导出；API 层拒绝所有业务写请求 |
+| admin 管理员 | 全部页面、审计 | 创建样本/批次、导入更正文件、查看/导出结果、查看写操作审计 |
+| operator 操作员 | 五个业务页面 | 登记 SQL、提交后台复核、导入更正文件、查看/导出结果；不可查看管理员审计 |
+| viewer 观察员 | 五个业务页面 | 只读与导出；API 层拒绝所有业务写请求 |
 
 ## 快速启动
 
@@ -67,6 +68,16 @@ ORDER BY customer
 
 失败态包括语法/白名单失败（提交前 422）、缺少样本（404）、重名（409）、任务配额（429）、数据库超时/运行错误（批次 failed，保存 error）。正常差异是 different，不当成异常。
 
+## 账单更正导入口径
+
+更正文件为 CSV，表头固定 `invoice_id,version,customer,route,amount,temperature,status,void`。每行是某账单号的一个版本快照；作废行 `void` 填 `true` 且仍需携带完整字段，作为该版本最终内容存档。
+
+- 版本裁决：同号仅采用更高版本；更低版本乱序到达直接跳过；同版本同内容幂等跳过；同版本异内容整批拒绝，本批所有写入回滚，拒绝原因与逐行明细留档可查。
+- 作废终态：账单作废后任何版本（包括更高版本）都不再复活；作废文件重放是幂等空操作。对不存在账单的作废会留下墓碑，阻止旧版本随后补入。
+- 幂等重试：文件内容 SHA-256 去重，同一文件重复导入返回首个处理记录，不重复写账；行级同版本同内容同样跳过。
+- 并发安全：逐账单 `pg_advisory_xact_lock` 按账单号排序加锁，交叉并发更正由数据库串行化，较高版本总是最终生效，不丢新值；整批在单事务内生效或整体回滚，中断不留半批。
+- 证据失效：每批生效使 `meta.data_version` 递增并记录触及的账单集合。每份证据保存生成时的数据版本与查询实际读取的账单集合（由 AST 简单谓词探针求得，为真实读集的安全超集；含子查询或外层引用的谓词所在层退化为全表）。证据读取的账单被后续更正触及即标记失效（stale），未受影响保持有效；在途复核发布前以 `FOR SHARE` 短锁比对数据版本，撞上更正的批次置为 stale 而非有效通过，执行期间不持锁，长复核不拖住更正生效。旧证据始终可查，权限与只读限制不变。
+
 ## 技术栈、结构与本地开发
 
 | 部分 | 实现 |
@@ -77,17 +88,19 @@ ORDER BY customer
 | db / cache | PostgreSQL 16、Redis 7 |
 | auth | JWT 8 小时有效，PBKDF2 SHA-256 加盐密码 |
 
-`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v1。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence，各自有模型、schema、服务、路由、API、store 和页面。
+`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v2。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence、correction（imports/import_items），各自有模型、schema、服务、路由、API、store 和页面。
 
 后端本地：创建虚拟环境并安装 `backend/requirements.txt`，先用 Compose 启动 db/redis，设置本地可达的 DATABASE_URL/REDIS_URL/JWT_SECRET，进入 backend 执行 `uvicorn src.main:app --reload`；worker 需 `/artifacts` 可写目录并执行 `python -m src.worker`。最省事的开发方式是修改源码后 `docker compose up -d --build`。前端通过 Nginx 的 `/api/` 去前缀代理访问后端，禁止双重 `/api/api`。
 
 环境变量：COMPOSE_PROJECT_NAME（容器命名）、FRONTEND_PORT/BACKEND_PORT/DB_PORT（宿主端口）、POSTGRES_PASSWORD（演示库密码）、JWT_SECRET（签名密钥）、SEED_DEMO（默认 true）。后端容器另接收 DATABASE_URL 和 REDIS_URL。5 个服务均有 healthcheck；数据库、Redis、共享证据各自使用命名卷。
 
-共享枚举位置：角色与任务状态在 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`；模型/鉴权服务/worker 消费后端值，状态标签与前端权限消费前端值。源数据 invoice status 为账单业务值 settled/pending，与任务状态独立。
+共享枚举位置：角色、任务状态、导入状态与行级处理结果在 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`；模型/鉴权服务/worker 消费后端值，状态标签与前端权限消费前端值。源数据 invoice status 为账单业务值 settled/pending，与任务状态独立。
 
 ## 已知边界
 
 - 小型工作流没有样本删除和版本编辑；新口径新建样本/批次，旧记录保持独立。
+- 更正导入同步在单事务内完成，单文件上限 5000 行；作废为终态，如需恢复须以新账单号补入。
+- 证据读集由 AST 简单谓词探针保守估计：含子查询或外层引用的查询层按全表处理，可能把未受影响的证据一并标记失效；反向遗漏不会发生。
 - 使用固定业务数据和单实例 worker；不对接生产数据库，不部署生产高可用。
 - 只允许受限 SQL 子集；不支持 CTE、窗口、跨表联接和用户自定义函数。
 - 查询会执行两次（一次 EXPLAIN ANALYZE，一次取结果）；数据源固定只读，避免两次间口径变化。
